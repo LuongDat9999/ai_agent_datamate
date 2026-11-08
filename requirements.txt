@@ -1,0 +1,10 @@
+pandas>=2.0
+openpyxl>=3.1
+xlrd>=2.0
+duckdb>=1.0
+openai
+sqlglot>=26.0
+transformers
+bitsandbytes
+accelerate  
+rapidfuzz  
