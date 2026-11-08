@@ -153,15 +153,34 @@ Ví dụ output:
 candidate, SQL, lỗi validate, retry, quyết định, confidence, output và thời gian từng
 module. Ưu tiên kiểm tra `error`, `flags`, `sql`, `result_head` và `abstain_reason`.
 
-## 10. Nhận xét thực nghiệm (sẽ bổ sung)
+## 10. Nhận xét thực nghiệm trên 100 câu train
 
-Phần này sẽ được cập nhật sau khi chạy 100 dòng dữ liệu train:
+Kết quả từ `outputs/score_100.txt`, trên hai doanh nghiệp `biz_101` và `biz_102`:
 
-- Số câu đúng/sai, `unanswerable` và `abstain`.
-- PA tổng và PA theo nhóm lỗi.
-- Các bug tiêu biểu và ví dụ output sai.
-- Thời gian khởi động, thời gian/câu và tổng thời gian thực thi.
-- Nhận xét về khả năng tổng quát hóa và ưu tiên cải tiến.
+| Chỉ số | Kết quả |
+|---|---:|
+| Số câu đã chấm | 100/3.000 |
+| Đúng | 4 |
+| Sai | 47 |
+| `abstain` | 49 |
+| `unanswerable` được dự đoán | 0 |
+| PA | -0.430000 |
+
+Môi trường chạy hiện tại:
+
+- Nền tảng: Kaggle.
+- Phần cứng: 2 GPU NVIDIA T4.
+- Model: `Qwen/Qwen2.5-7B-Instruct`.
+- Prompt bị giới hạn số lượng token do hạn chế bộ nhớ và năng lực xử lý.
+- Thời gian chạy 100 câu: **61,68 phút**, đã bao gồm thời gian load model.
+
+Hệ thống đã sinh câu trả lời ở 51 câu nhưng chỉ 4 câu chính xác. Các kết quả sai thường
+bị phóng đại nhiều lần, cho thấy cần ưu tiên sửa logic lọc và tổng hợp dữ liệu trước khi
+chỉ tối ưu model hoặc format.
+
+Theo doanh nghiệp, `biz_101` đạt PA `-0.80`, thấp hơn `biz_102` (`-0.183333`), cho thấy
+pipeline phụ thuộc mạnh vào schema và dạng dữ liệu. Theo type, `number` yếu nhất
+(`-0.493506`); `percent` và `list` cùng đạt `-0.142857`, còn `date` đạt `-0.428571`.
 
 ## 11. Những việc đã làm được
 
@@ -175,21 +194,43 @@ Phần này sẽ được cập nhật sau khi chạy 100 dòng dữ liệu trai
 
 ## 12. Hạn chế hiện tại
 
-- Chưa có báo cáo PA/accuracy được xác nhận cho lần chạy 100 câu.
 - Chưa có benchmark chính thức giữa các backend/model.
 - `main.py` hiện chạy `k=1`; self-consistency voting nhiều candidate chưa được khai thác
   đầy đủ trong flow mặc định.
 - Chất lượng phụ thuộc mạnh vào model, schema profile và dữ liệu bẩn.
 - Chưa chứng minh đầy đủ khả năng chạy offline trong Docker và giới hạn phần cứng.
-- Các lỗi dòng tổng, ngày mơ hồ, quy đổi đơn vị và JOIN vẫn cần kiểm tra bằng dữ liệu
-  thực nghiệm.
+- Các lỗi dòng tổng, ngày mơ hồ, quy đổi đơn vị và JOIN vẫn còn ảnh hưởng trực tiếp đến
+  kết quả.
 
 ## 13. Hướng đi tiếp theo
 
-1. Chạy và lưu kết quả trên 100 câu train, đối chiếu với `answers.jsonl`.
-2. Tính PA theo nhóm lỗi: thời gian, entity, JOIN, `unanswerable`, format.
-3. Đọc các file debug để phân loại bug lặp lại và bổ sung test hồi quy.
-4. Benchmark model/backend và chọn cấu hình theo PA cùng thời gian chạy.
-5. Bật voting nhiều candidate, tối ưu ngưỡng trả lời/abstain.
-6. Cải thiện chuẩn hóa ngày, tiền tệ, dòng tổng và quy đổi đơn vị.
-7. Kiểm thử Docker offline, giới hạn timeout và độ ổn định giữa hai lần chạy.
+1. Sửa lỗi lọc ngày và trạng thái trước; đây là các cờ xuất hiện nhiều nhất trong debug.
+2. Kiểm tra JOIN, cấp độ tổng hợp và quy đổi đơn vị để tránh tổng tiền bị phóng đại.
+3. Cải thiện chiến lược `abstain`: hiện 49 câu bị bỏ qua nhưng chưa có câu nào được
+   chấm là `unanswerable`.
+4. Đọc debug, phân loại bug lặp lại, bổ sung test hồi quy và chạy lại 100 câu.
+5. Benchmark model/backend, bật voting nhiều candidate và tối ưu ngưỡng trả lời.
+6. Kiểm thử Docker offline, timeout và độ ổn định giữa hai lần chạy.
+
+### Tín hiệu bug từ `outputs/debug_100/debug.jsonl`
+
+- `NO_STATUS_FILTER`: 69 lần.
+- `NO_DATE_FILTER`: 41 lần.
+- `PARSE_ERROR`: 22 lần.
+- `UNSAFE_SQL`: 4 lần; `FANOUT_RISK`: 2 lần; `CARTESIAN`: 1 lần.
+
+Thứ tự ưu tiên sửa: bắt buộc xác định bộ lọc ngày/trạng thái, sửa parse ngày và kiểu số,
+kiểm tra JOIN chống nhân dòng, sau đó cải thiện entity matching và câu hỏi dạng list/percent.
+
+### Thời gian thực thi
+
+Thời gian thực tế của toàn bộ lần chạy là **61,68 phút/100 câu**, bao gồm cả thời gian
+load model. Đây là kết quả trên Kaggle với 2 GPU T4 và `Qwen/Qwen2.5-7B-Instruct`;
+không nên so sánh trực tiếp với thời gian chạy trên phần cứng khác.
+
+### Hướng nâng cấp
+
+Thử nghiệm tiếp theo dự kiến chạy trên GPU **RTX 5090**, sử dụng model
+`Qwen3-14B` và tăng ngân sách token của prompt. Mục tiêu là cung cấp schema, rulebook,
+ví dụ few-shot và ngữ cảnh đầy đủ hơn cho model, đồng thời đánh giá lại PA, tỷ lệ
+`abstain` và thời gian thực thi.
