@@ -241,6 +241,11 @@ def _resolver_candidate(
     periods: dict[str, Any],
     entity_vocab: set[str] | None = None,
 ) -> tuple[Candidate | None, str | None]:
+    if archetype == "period_compare" and not any(
+        marker in question.casefold()
+        for marker in ("%", "phan tram", "phần trăm", "tang truong", "tăng trưởng")
+    ):
+        return None, "compare_not_percent"
     try:
         from ai_agent_datamate.tool.qtype import is_simple_metric_question
         allowed, reason = is_simple_metric_question(
@@ -262,6 +267,12 @@ def _resolver_candidate(
         else "cancel_rate" if archetype == "cancel_rate"
         else "orders" if archetype == "order_count_period" else "revenue"
     )
+    if (
+        metric == "revenue"
+        and archetype in {"revenue_period", "period_compare"}
+        and config.get("revenue_basis") == "invoice_total"
+    ):
+        return None, "revenue_basis_invoice_total"
     try:
         if archetype == "period_compare":
             first, second = periods.get("target"), periods.get("compare")

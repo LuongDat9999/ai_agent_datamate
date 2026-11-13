@@ -145,6 +145,8 @@ def is_simple_metric_question(
         return False, "quantity_question"
 
     residual = [token for token in _remove_known_metric_phrases(text).split() if token]
+    if "ca" in residual and ("sang" in residual or "chieu" in residual):
+        return False, "has_entity"
     if residual and entity_vocab is None and conn is not None:
         entity_vocab = build_entity_vocab(conn, business_id)
     if residual and (

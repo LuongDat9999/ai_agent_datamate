@@ -14,7 +14,7 @@ from .cleaner import vn_norm
 STATUS_VALUES = {
     "huy": frozenset({"huy", "da huy", "huy don", "cancel", "cancelled"}),
     "tra_hang": frozenset({
-        "tra hang", "tra lai", "hoan tra", "hoan hang", "hoan tien",
+        "tra hang", "doi tra", "tra lai", "hoan tra", "hoan hang", "hoan tien",
         "da tra", "return", "returned",
     }),
     "dang_giao": frozenset({"dang giao", "cho giao", "dang van chuyen", "shipping"}),
@@ -22,7 +22,7 @@ STATUS_VALUES = {
 }
 _LOGGER = logging.getLogger(__name__)
 _STATUS_PHRASES = {
-    "tra_hang": ("hoan hang", "hoan tra", "tra hang", "hoan tien", "tra lai", "da tra", "returned", "return"),
+    "tra_hang": ("hoan hang", "hoan tra", "tra hang", "doi tra", "hoan tien", "tra lai", "da tra", "returned", "return"),
     "hoan_thanh": ("da hoan thanh", "hoan thanh", "completed", "done", "xong"),
     "dang_giao": ("dang van chuyen", "dang giao", "cho giao", "shipping"),
     "huy": ("da huy", "huy don", "cancelled", "cancel", "huy"),

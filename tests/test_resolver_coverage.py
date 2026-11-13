@@ -70,7 +70,7 @@ class ResolverCoverageTests(unittest.TestCase):
 
     def test_compare_period_outside_data_is_unanswerable(self):
         candidate, reason = _resolver_candidate(
-            _Context(), CFG, "period_compare", "doanh thu so với kỳ trước",
+            _Context(), CFG, "period_compare", "doanh thu thay đổi bao nhiêu % so với kỳ trước",
             {
                 "target": {"start": "2025-03-01", "end": "2025-03-31"},
                 "compare": {"start": "2024-12-01", "end": "2024-12-31"},
@@ -78,6 +78,26 @@ class ResolverCoverageTests(unittest.TestCase):
         )
         self.assertEqual(reason, "period_outside_data")
         self.assertEqual(candidate.answer_type, "unanswerable")
+
+    def test_compare_without_percent_is_rejected(self):
+        candidate, reason = _resolver_candidate(
+            _Context(), CFG, "period_compare", "doanh thu chênh lệch so với kỳ trước",
+            {
+                "target": {"start": "2025-03-01", "end": "2025-03-31"},
+                "compare": {"start": "2025-02-01", "end": "2025-02-28"},
+            }, set(),
+        )
+        self.assertIsNone(candidate)
+        self.assertEqual(reason, "compare_not_percent")
+
+    def test_invoice_total_revenue_is_rejected(self):
+        config = {**CFG, "revenue_basis": "invoice_total"}
+        candidate, reason = _resolver_candidate(
+            _Context(), config, "revenue_period", "doanh thu tháng 3/2025",
+            {"target": {"start": "2025-03-01", "end": "2025-03-31"}}, set(),
+        )
+        self.assertIsNone(candidate)
+        self.assertEqual(reason, "revenue_basis_invoice_total")
 
     def test_partial_period_returns_value(self):
         candidate, reason = _resolver_candidate(

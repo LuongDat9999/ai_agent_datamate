@@ -79,6 +79,11 @@ class QuestionTypeTests(unittest.TestCase):
             entity_vocab=vocab,
         )[0])
 
+    def test_shift_residual_is_an_entity(self):
+        allowed, reason = is_simple_metric_question("doanh thu ca sang")
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "has_entity")
+
     def test_eval_period_guard_rejects_empty_period(self):
         class Connection:
             def execute(self, query):

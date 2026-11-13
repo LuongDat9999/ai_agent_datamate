@@ -65,7 +65,7 @@ def _money_columns(names: list[str], numeric: set[str]) -> tuple[list[str], list
     invoice = [column for column in numeric if any(
         hint in column.casefold() for hint in _INVOICE_MONEY_HINTS
     )]
-    return line, invoice
+    return sorted(line), sorted(invoice)
 
 
 def _formula_revenue(conn: Any, table: str, names: list[str], numeric: set[str]) -> tuple[str | None, float]:
@@ -203,7 +203,7 @@ def infer_metric_config(conn: Any, profile: Any = None) -> dict[str, Any]:
                 revenue = _choose(generic_money, _MONEY_HINTS)
                 revenue_reason = "generic amount column without invoice-total hint"
         if revenue is None and grain == "order":
-            revenue = invoice_money[0] if invoice_money else _choose(list(numeric), _MONEY_HINTS)
+            revenue = invoice_money[0] if invoice_money else _choose(sorted(numeric), _MONEY_HINTS)
             if revenue:
                 revenue_reason = "order-grain total"
         if revenue is None and grain == "line" and invoice_money:
@@ -224,6 +224,13 @@ def infer_metric_config(conn: Any, profile: Any = None) -> dict[str, Any]:
         status_column = _find_status_column(conn, selected, names)
         if status_column is None:
             return {"ok": False, "reason": "no status column"}
+        if status_column == "trang_thai_chuan":
+            unmapped_count = conn.execute(
+                f"SELECT COUNT(*) FROM {_q(selected)} "
+                f"WHERE {_q(status_column)} = 'khong_ro'"
+            ).fetchone()[0]
+            if unmapped_count > 0:
+                return {"ok": False, "reason": f"unmapped_status:{unmapped_count}"}
         aggregation = "SUM"
         if grain == "line":
             repeated = conn.execute(
@@ -263,6 +270,11 @@ def infer_metric_config(conn: Any, profile: Any = None) -> dict[str, Any]:
             ),
             "revenue_aggregation": aggregation,
             "revenue_column_reason": revenue_reason,
+            "revenue_basis": (
+                "invoice_total"
+                if revenue_reason.startswith(("order-grain total", "invoice total"))
+                else "line_amount"
+            ),
             "dedupe": False,
             "min_date": min_date,
             "max_date": max_date,
@@ -274,7 +286,11 @@ def infer_metric_config(conn: Any, profile: Any = None) -> dict[str, Any]:
 
 def infer_metric_config_for_context(context: Any) -> dict[str, Any]:
     """Infer metrics by scanning every table/view in a loaded business."""
-    return infer_metric_config(context.con, None)
+    selected = next(
+        (name for name, profile in context.tables.items() if "ngay" in _columns(profile)),
+        None,
+    )
+    return infer_metric_config(context.con, context.tables.get(selected))
 
 
 def _metric_expression(cfg: dict[str, Any], metric: str) -> str:

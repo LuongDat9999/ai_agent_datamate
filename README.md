@@ -30,6 +30,8 @@ Module `dataprocess` quét dữ liệu theo doanh nghiệp và:
 6. Giữ ngữ cảnh dữ liệu theo doanh nghiệp để tái sử dụng cho nhiều câu hỏi.
 7. Suy luận cột doanh thu cấp dòng, loại đơn huỷ/trả hàng theo mã đơn và kiểm tra
    phạm vi ngày trước khi kết luận dữ liệu không tồn tại.
+8. Từ chối cấu hình metric nếu bảng đã chuẩn hóa còn trạng thái `khong_ro`; mỗi đơn
+   phải thuộc một trong bốn trạng thái hợp lệ.
 
 Các quy tắc làm sạch quan trọng gồm xử lý ngày tháng, tiền tệ, tiêu đề nhiều tầng,
 forward-fill và tránh nhân dòng khi JOIN. Đây là phần cần tiếp tục kiểm chứng trên
@@ -50,6 +52,13 @@ Với mỗi câu hỏi, hệ thống:
 8. Chọn kết quả, `unanswerable` khi dữ liệu nằm ngoài phạm vi được bảo đảm, hoặc
    `abstain` nếu không đủ tin cậy.
 9. Chuẩn hóa kết quả về schema JSON thống nhất.
+
+Metric resolver có thêm các guard nghiệp vụ:
+
+- Doanh thu chỉ dùng cột cấp dòng; cấu hình suy ra từ tổng hóa đơn được đánh dấu
+  `revenue_basis=invoice_total` và không được resolver trả lời.
+- Câu so sánh kỳ chỉ được resolver khi câu hỏi yêu cầu phần trăm/tăng trưởng.
+- Các câu chứa thực thể ca sáng hoặc ca chiều không được coi là metric đơn giản.
 
 ## 5. Ý tưởng xử lý rulebook
 
@@ -180,7 +189,7 @@ benchmark cũ để kết luận chất lượng hiện tại của pipeline.
 - Có xử lý thời gian, entity matching, few-shot và schema/capability profile.
 - Có validate SQL, retry khi lỗi và chuẩn hóa nhiều kiểu output.
 - Có log debug theo từng câu hỏi và đo thời gian theo module.
-- Có unit test cho một phần xử lý ngày và trạng thái đơn.
+- Có unit test cho xử lý ngày, trạng thái đơn, metric resolver và các guard câu hỏi.
 - Có metric resolver cho doanh thu, số đơn, đơn huỷ và tỉ lệ huỷ.
 - Có phân biệt `unanswerable` với `abstain`, kèm reason và trace coverage.
 - Có script `eval/check_dedupe.py` để so sánh kết quả có/không loại dòng trùng.

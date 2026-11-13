@@ -1,10 +1,13 @@
 import unittest
+from unittest.mock import patch
 
 import pandas as pd
 
 from ai_agent_datamate.dataprocess.loader import _connect_duckdb
 from ai_agent_datamate.dataprocess.order_status import standardize_statuses
-from ai_agent_datamate.tool.metrics import build_metric_sql, infer_metric_config
+from ai_agent_datamate.tool.metrics import (
+    build_metric_sql, infer_metric_config, infer_metric_config_for_context,
+)
 
 
 class MetricTests(unittest.TestCase):
@@ -32,7 +35,7 @@ class MetricTests(unittest.TestCase):
             "orders": pd.DataFrame({
                 "ma_don": ["A", "A", "B", "C", "D"],
                 "ngay": ["2025-01-01"] * 5,
-                "status": ["Đang giao", "Xong", "Hủy", "Trả hàng", "Chờ xác nhận"],
+                "status": ["Đang giao", "Xong", "Hủy", "Trả hàng", "Xong"],
                 "amount": [10, 20, 30, 40, 50],
             })
         }
@@ -62,6 +65,24 @@ class MetricTests(unittest.TestCase):
         config = infer_metric_config(con)
         self.assertFalse(config["ok"])
         self.assertEqual(config["reason"], "no status column")
+
+    def test_inference_rejects_unmapped_normalized_status(self):
+        config = infer_metric_config(_connect_duckdb({
+            "orders": pd.DataFrame({
+                "ma_don": ["A"], "ngay": ["2025-01-01"],
+                "trang_thai_chuan": ["khong_ro"], "amount": [10],
+            })
+        }))
+        self.assertEqual(config, {"ok": False, "reason": "unmapped_status:1"})
+
+    def test_context_passes_selected_table_profile(self):
+        context = type("Context", (), {
+            "con": object(),
+            "tables": {"sales": {"columns": {"ngay": {"dtype": "DATE"}}}},
+        })()
+        with patch("ai_agent_datamate.tool.metrics.infer_metric_config", return_value={"ok": True}) as mocked:
+            self.assertEqual(infer_metric_config_for_context(context), {"ok": True})
+        mocked.assert_called_once_with(context.con, context.tables["sales"])
 
 
 if __name__ == "__main__":
