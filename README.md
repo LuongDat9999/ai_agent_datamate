@@ -28,6 +28,8 @@ Module `dataprocess` quét dữ liệu theo doanh nghiệp và:
    (ví dụ có/không có chi tiết sản phẩm).
 5. Tạo danh mục thực thể để hỗ trợ tìm sản phẩm, khách hàng, chi nhánh.
 6. Giữ ngữ cảnh dữ liệu theo doanh nghiệp để tái sử dụng cho nhiều câu hỏi.
+7. Suy luận cột doanh thu cấp dòng, loại đơn huỷ/trả hàng theo mã đơn và kiểm tra
+   phạm vi ngày trước khi kết luận dữ liệu không tồn tại.
 
 Các quy tắc làm sạch quan trọng gồm xử lý ngày tháng, tiền tệ, tiêu đề nhiều tầng,
 forward-fill và tránh nhân dòng khi JOIN. Đây là phần cần tiếp tục kiểm chứng trên
@@ -45,7 +47,8 @@ Với mỗi câu hỏi, hệ thống:
 5. Gọi backend LLM để sinh candidate truy vấn và kiểu câu trả lời.
 6. Kiểm tra SQL tĩnh/ngữ nghĩa, chạy trong DuckDB và retry tối đa hai lần khi lỗi.
 7. Kiểm tra khả năng trả lời, loại bỏ candidate không an toàn hoặc thiếu bộ lọc ngày.
-8. Chọn kết quả hoặc `abstain` nếu không đủ tin cậy.
+8. Chọn kết quả, `unanswerable` khi dữ liệu nằm ngoài phạm vi được bảo đảm, hoặc
+   `abstain` nếu không đủ tin cậy.
 9. Chuẩn hóa kết quả về schema JSON thống nhất.
 
 ## 5. Ý tưởng xử lý rulebook
@@ -86,6 +89,8 @@ Với mỗi câu hỏi, hệ thống:
 | `decision/checker.py` | Kiểm tra capability, candidate và quyết định kết quả. |
 | `decision/voting.py` | Thành phần hỗ trợ voting/kết hợp kết quả. |
 | `formatting/format_enforcer.py` | Ép kiểu và chuẩn hóa output. |
+| `tool/metrics.py` | Suy luận cấu hình metric, tạo SQL doanh thu/số đơn và coverage guard. |
+| `dataprocess/order_status.py` | Chuẩn hóa trạng thái đơn và tạo quy ước trạng thái cho prompt. |
 
 ## 7. Flow thực hiện (`main.py`)
 
@@ -94,10 +99,11 @@ Với mỗi câu hỏi, hệ thống:
   → chọn split và tối đa 100 câu hỏi
   → đọc rulebook, calendar, few-shot bank
   → load_business() và cache dữ liệu theo business_id
+  → thử metric resolver cho các câu doanh thu/số đơn đơn giản
   → build_prompt() cho từng câu hỏi
-  → generate_candidates()
+  → generate_candidates(k candidates; mặc định k=1)
   → validate_with_retry() (tối đa 2 retry)
-  → decide() / abstain khi không đủ điều kiện
+  → decide() / abstain khi candidate invalid, có cờ chặn hoặc confidence thấp
   → to_answer()
   → ghi outputs/answers.jsonl và outputs/debug/debug.jsonl
 ```
@@ -112,6 +118,11 @@ python main.py --split_dir data/train --limit 100 \
 
 Backend mặc định lấy từ `LLM_BACKEND` (mặc định `hf`); có thể chọn `mock`, `hf` hoặc
 `vllm`. `--sample_mode diverse` dùng để lấy mẫu theo nhiều doanh nghiệp.
+
+Cổng quyết định đọc ngưỡng và mức phạt từ biến môi trường:
+`DECISION_MIN_CONFIDENCE`, `DECISION_SOFT_FLAG_PENALTY`,
+`DECISION_RETRY_PENALTY`, `DECISION_RESULT_SIZE_PENALTY`.
+Các cờ chặn cứng luôn dẫn đến `abstain`; cảnh báo mềm chỉ làm giảm confidence.
 
 ## 8. Cấu trúc thư mục
 
@@ -148,39 +159,18 @@ Ví dụ output:
 - `answer`: đáp án cuối cùng sau khi truy vấn và format.
 - `unanswerable`: dữ liệu không chứa đủ thông tin để trả lời.
 - `abstain`: hệ thống không đủ tin cậy, lỗi, timeout hoặc vi phạm điều kiện kiểm tra.
+- Với `unanswerable`, output có thể kèm `reason` dạng chuỗi; không so sánh nội dung
+  reason khi đối chiếu đáp án gold.
 
 Để đọc bug, xem `outputs/debug/debug.jsonl`: mỗi dòng chứa câu hỏi, period/entity hint,
 candidate, SQL, lỗi validate, retry, quyết định, confidence, output và thời gian từng
 module. Ưu tiên kiểm tra `error`, `flags`, `sql`, `result_head` và `abstain_reason`.
 
-## 10. Nhận xét thực nghiệm trên 100 câu train
+## 10. Nhận xét thực nghiệm
 
-Kết quả từ `outputs/score_100.txt`, trên hai doanh nghiệp `biz_101` và `biz_102`:
-
-| Chỉ số | Kết quả |
-|---|---:|
-| Số câu đã chấm | 100/3.000 |
-| Đúng | 4 |
-| Sai | 47 |
-| `abstain` | 49 |
-| `unanswerable` được dự đoán | 0 |
-| PA | -0.430000 |
-
-Môi trường chạy hiện tại:
-
-- Nền tảng: Kaggle.
-- Phần cứng: 2 GPU NVIDIA T4.
-- Model: `Qwen/Qwen2.5-7B-Instruct`.
-- Prompt bị giới hạn số lượng token do hạn chế bộ nhớ và năng lực xử lý.
-- Thời gian chạy 100 câu: **61,68 phút**, đã bao gồm thời gian load model.
-
-Hệ thống đã sinh câu trả lời ở 51 câu nhưng chỉ 4 câu chính xác. Các kết quả sai thường
-bị phóng đại nhiều lần, cho thấy cần ưu tiên sửa logic lọc và tổng hợp dữ liệu trước khi
-chỉ tối ưu model hoặc format.
-
-Theo doanh nghiệp, `biz_101` đạt PA `-0.80`, thấp hơn `biz_102` (`-0.183333`), cho thấy
-pipeline phụ thuộc mạnh vào schema và dạng dữ liệu. Theo type, `number` yếu nhất
-(`-0.493506`); `percent` và `list` cùng đạt `-0.142857`, còn `date` đạt `-0.428571`.
+Chưa chạy lại kết quả benchmark sau các thay đổi về trạng thái đơn, chọn cột doanh thu,
+dedupe và coverage guard, nên phần này **chưa cập nhật số liệu**. Không dùng các số liệu
+benchmark cũ để kết luận chất lượng hiện tại của pipeline.
 
 ## 11. Những việc đã làm được
 
@@ -191,10 +181,13 @@ pipeline phụ thuộc mạnh vào schema và dạng dữ liệu. Theo type, `nu
 - Có validate SQL, retry khi lỗi và chuẩn hóa nhiều kiểu output.
 - Có log debug theo từng câu hỏi và đo thời gian theo module.
 - Có unit test cho một phần xử lý ngày và trạng thái đơn.
+- Có metric resolver cho doanh thu, số đơn, đơn huỷ và tỉ lệ huỷ.
+- Có phân biệt `unanswerable` với `abstain`, kèm reason và trace coverage.
+- Có script `eval/check_dedupe.py` để so sánh kết quả có/không loại dòng trùng.
 
 ## 12. Hạn chế hiện tại
 
-- Chưa có benchmark chính thức giữa các backend/model.
+- Chưa có benchmark chính thức mới giữa các backend/model sau các thay đổi gần đây.
 - `main.py` hiện chạy `k=1`; self-consistency voting nhiều candidate chưa được khai thác
   đầy đủ trong flow mặc định.
 - Chất lượng phụ thuộc mạnh vào model, schema profile và dữ liệu bẩn.
@@ -204,15 +197,16 @@ pipeline phụ thuộc mạnh vào schema và dạng dữ liệu. Theo type, `nu
 
 ## 13. Hướng đi tiếp theo
 
-1. Sửa lỗi lọc ngày và trạng thái trước; đây là các cờ xuất hiện nhiều nhất trong debug.
+1. Chạy lại benchmark theo từng business và cập nhật mục 10 khi có kết quả ổn định.
 2. Kiểm tra JOIN, cấp độ tổng hợp và quy đổi đơn vị để tránh tổng tiền bị phóng đại.
-3. Cải thiện chiến lược `abstain`: hiện 49 câu bị bỏ qua nhưng chưa có câu nào được
-   chấm là `unanswerable`.
-4. Đọc debug, phân loại bug lặp lại, bổ sung test hồi quy và chạy lại 100 câu.
+3. Dùng `eval/check_dedupe.py` để quyết định dedupe riêng theo business dựa trên gold.
+4. Đọc debug, phân loại bug lặp lại, bổ sung test hồi quy và chạy lại benchmark.
 5. Benchmark model/backend, bật voting nhiều candidate và tối ưu ngưỡng trả lời.
 6. Kiểm thử Docker offline, timeout và độ ổn định giữa hai lần chạy.
 
-### Tín hiệu bug từ `outputs/debug_100/debug.jsonl`
+### Tín hiệu bug lịch sử từ `outputs/debug_100/debug.jsonl`
+
+Các số liệu dưới đây là log của một lần chạy cũ, chưa được cập nhật theo code hiện tại.
 
 - `NO_STATUS_FILTER`: 69 lần.
 - `NO_DATE_FILTER`: 41 lần.
