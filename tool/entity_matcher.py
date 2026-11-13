@@ -48,16 +48,20 @@ def _score(query: str, value: str) -> float:
 
 
 def _columns(index: Any) -> Iterable[tuple[str, str, list[str]]]:
-    values = getattr(index, "values", None)
+    if isinstance(index, dict) and isinstance(index.get("values"), dict):
+        values = index["values"]
+    else:
+        values = getattr(index, "values", None)
     if values is None or callable(values):
         values = index
     for column, tables in (values or {}).items():
         normalized_column = vn_norm(column)
         if normalized_column.endswith("_raw") or normalized_column.endswith("_goc"):
             continue
-        if any(token in normalized_column for token in ("ngay", "thoi gian", "date", "time", "thang", "nam")):
+        column_tokens = set(normalized_column.split())
+        if column_tokens & {"ngay", "date", "time", "thang", "nam"} or "thoi gian" in normalized_column:
             continue
-        if any(token in normalized_column for token in ("so luong", "gia", "tien", "amount", "number", "id")):
+        if column_tokens & {"gia", "tien", "amount", "number", "id"} or "so luong" in normalized_column:
             continue
         if isinstance(tables, dict):
             for table, entries in tables.items():
@@ -74,7 +78,7 @@ def _spans(question: str, max_words: int = 7) -> set[str]:
             if len(span_tokens) == 1:
                 if len(span) < 5 or span in _TIME_OR_NUMBER:
                     continue
-            elif any(token in _TIME_OR_NUMBER or token.isdigit() for token in span_tokens):
+            elif all(token in _TIME_OR_NUMBER or token.isdigit() for token in span_tokens):
                 continue
             if span not in STOPWORDS:
                 spans.add(span)
@@ -93,7 +97,12 @@ def match_entities(question: str, index: Any, topk: int = 3, threshold: float = 
                 else sorted(((vn_norm(value), _score(query, vn_norm(value)), idx) for idx, value in enumerate(values)), key=lambda item: item[1], reverse=True)[:topk]
             )
             for _, score, idx in matches:
+                rarity = sum(1 for value in values if vn_norm(query) in vn_norm(value))
                 minimum = 95 if len(query.split()) == 1 else 90
+                if rarity == 0:
+                    continue
+                if len(query.split()) >= 2 and len(query) < 8:
+                    continue
                 if score < minimum:
                     continue
                 candidates.append(EntityHint(query, table, column, values[idx], round(float(score), 2)))

@@ -6,13 +6,45 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal
+from os import environ
 from typing import Any, Iterable
 
-from ..llm.generator import Candidate
+from ..llm.generator import ANSWER_TYPES, Candidate, resolve_candidate_type
 from ..sqlrunner.validator import HARD_FLAGS
 
-SOFT_FLAGS = frozenset({"NO_DATE_FILTER", "NO_STATUS_FILTER", "UNIT_MISMATCH"})
-HEAVY_FLAGS = HARD_FLAGS | frozenset({"SHAPE", "PCT_RANGE", "UNKNOWN_ENTITY", "JOIN_MISMATCH", "EMPTY"})
+SOFT_FLAGS = frozenset({"UNIT_MISMATCH"})
+HARD_DECISION_FLAGS = HARD_FLAGS | frozenset({
+    "PARSE_ERROR", "FANOUT_RISK", "SHAPE", "PCT_RANGE", "UNKNOWN_ENTITY",
+    "JOIN_MISMATCH", "EMPTY", "UNSUPPORTED_DATA", "NO_STATUS_FILTER",
+    "LINE_GRAIN_ORDER_METRIC", "NO_DATE_FILTER",
+})
+HEAVY_FLAGS = HARD_DECISION_FLAGS
+
+
+@dataclass(frozen=True)
+class DecisionConfig:
+    min_confidence: float = 0.6
+    soft_flag_penalty: float = 0.1
+    retry_penalty: float = 0.05
+    result_size_penalty: float = 0.1
+
+    @classmethod
+    def from_env(cls) -> "DecisionConfig":
+        def number(name: str, default: float) -> float:
+            try:
+                value = float(environ.get(name, default))
+            except (TypeError, ValueError):
+                raise ValueError(f"{name} must be numeric")
+            if not 0 <= value <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+            return value
+
+        return cls(
+            min_confidence=number("DECISION_MIN_CONFIDENCE", cls.min_confidence),
+            soft_flag_penalty=number("DECISION_SOFT_FLAG_PENALTY", cls.soft_flag_penalty),
+            retry_penalty=number("DECISION_RETRY_PENALTY", cls.retry_penalty),
+            result_size_penalty=number("DECISION_RESULT_SIZE_PENALTY", cls.result_size_penalty),
+        )
 
 
 def _norm(value: Any) -> str:
@@ -44,6 +76,53 @@ def canonical(cols: list[str] | None, rows: list[list[Any]] | None, answer_type:
 class CheckReport:
     flags: tuple[str, ...]
     supported: bool = True
+
+
+def _set_reason(candidate: Candidate, reason: str) -> None:
+    candidate.abstain_reason = reason
+
+
+def _sql_complete(sql: str | None) -> bool:
+    if not isinstance(sql, str) or not sql.strip():
+        return False
+    text = sql.strip().rstrip(";").strip()
+    if text.count("(") != text.count(")") or text.count("'") % 2 or text.count('"') % 2:
+        return False
+    return not re.search(r"(?:\bfrom|\bjoin|\bwhere|\band|\bor|,|=)\s*$", text, re.IGNORECASE)
+
+
+def _blocking_flags(candidate: Candidate, periods: dict[str, Any] | None) -> set[str]:
+    if "RESOLVER" in candidate.flags:
+        return set()
+    flags = set(candidate.flags) & HARD_DECISION_FLAGS
+    return flags
+
+
+def blocking_flags(candidate: Candidate, periods: dict[str, Any] | None = None) -> set[str]:
+    """Return decision-gate flags, excluding resolver candidates."""
+    return _blocking_flags(candidate, periods)
+
+
+def confidence_for_candidates(
+    candidates: Iterable[Candidate],
+    winner: Candidate | None,
+    *,
+    config: DecisionConfig | None = None,
+) -> float:
+    config = config or DecisionConfig.from_env()
+    candidates = list(candidates)
+    if winner is None or not candidates:
+        return 0.0
+    eligible = [candidate for candidate in candidates if not _blocking_flags(candidate, None)]
+    agreement = sum(candidate.canon == winner.canon for candidate in eligible) / len(candidates)
+    confidence = agreement
+    confidence -= config.soft_flag_penalty * len(set(winner.flags) & SOFT_FLAGS)
+    confidence -= config.retry_penalty * int(getattr(winner, "_retry_count", 0))
+    if len(winner.rows or []) > 1000:
+        confidence -= config.result_size_penalty
+    if not winner.rows or all(value is None for row in winner.rows for value in row):
+        return 0.0
+    return max(0.0, min(1.0, confidence))
 
 
 def _intent_support(question: str, capabilities: dict[str, Any]) -> tuple[bool, bool]:
@@ -115,37 +194,64 @@ def check_candidates(
 def decide(
     candidates: Iterable[Candidate],
     capabilities: dict[str, Any] | None = None,
-    tau: float = 0.6,
+    tau: float | None = None,
     question: str = "",
     periods: dict[str, Any] | None = None,
 ) -> tuple[str, Candidate | None]:
-    """Return an answer only for one executed, non-null, type-compatible result."""
+    """Return an answer only for a complete, safe, sufficiently confident result."""
     candidates = list(candidates)
     if not candidates:
         return "abstain", None
-    candidate = candidates[0]
-    if candidate.answer_type == "unanswerable":
+    config = DecisionConfig.from_env()
+    threshold = config.min_confidence if tau is None else tau
+    if not 0 <= threshold <= 1:
+        raise ValueError("tau must be between 0 and 1")
+    valid: list[Candidate] = []
+    for candidate in candidates:
+        if question:
+            resolve_candidate_type(candidate, question)
+        prior_reason = candidate.abstain_reason
+        candidate.abstain_reason = None
+        report = check_candidate(candidate, question, capabilities, periods)
+        candidate.flags.extend(flag for flag in report.flags if flag not in candidate.flags)
+        if prior_reason == "no_sql_found":
+            _set_reason(candidate, prior_reason)
+        elif candidate.answer_type == "undetermined":
+            _set_reason(candidate, "type_undetermined")
+        elif candidate.answer_type not in ANSWER_TYPES:
+            _set_reason(candidate, "invalid_answer_type")
+        elif candidate.answer_type != "unanswerable" and not _sql_complete(candidate.sql):
+            _set_reason(candidate, "missing_or_incomplete_sql")
+            candidate.flags.append("PARSE_ERROR")
+        elif candidate.error:
+            _set_reason(candidate, "execution_or_validation_error")
+        elif _blocking_flags(candidate, periods):
+            _set_reason(candidate, "hard_blocking_flags:" + ",".join(sorted(_blocking_flags(candidate, periods))))
+        elif candidate.answer_type != "unanswerable" and not candidate.rows:
+            _set_reason(candidate, "empty_result")
+            candidate.flags.append("EMPTY")
+        else:
+            valid.append(candidate)
+    if not valid:
+        return "abstain", None
+    answer_candidates = [candidate for candidate in valid if candidate.answer_type != "unanswerable"]
+    if not answer_candidates:
         return "unanswerable", None
-    rows = candidate.rows or []
-    if candidate.error or not rows or all(value is None for row in rows for value in row):
+    for candidate in answer_candidates:
+        candidate.canon = repr(canonical(candidate.columns, candidate.rows, candidate.answer_type))
+    counts = {}
+    for candidate in answer_candidates:
+        counts[candidate.canon] = counts.get(candidate.canon, 0) + 1
+    winner = max(answer_candidates, key=lambda item: counts[item.canon])
+    confidence = confidence_for_candidates(answer_candidates, winner, config=config)
+    if confidence < threshold:
+        _set_reason(winner, f"confidence_below_threshold:{confidence:.3f}<{threshold:.3f}")
         return "abstain", None
-    if candidate.answer_type in {"number", "percent"}:
-        try:
-            float(rows[0][0])
-        except (TypeError, ValueError):
-            return "abstain", None
-    elif candidate.answer_type == "boolean" and not isinstance(rows[0][0], bool):
-        return "abstain", None
-    elif candidate.answer_type in {"list", "table"}:
-        if not all(row for row in rows):
-            return "abstain", None
-        if candidate.answer_type == "list" and not all(len(row) == 1 for row in rows):
-            return "abstain", None
-        if candidate.answer_type == "table" and not candidate.columns:
-            return "abstain", None
-    elif candidate.answer_type in {"string", "date"} and rows[0][0] is None:
-        return "abstain", None
-    return "answer", candidate
+    return "answer", winner
 
 
-__all__ = ["CheckReport", "canonical", "check_candidate", "check_candidates", "decide"]
+__all__ = [
+    "CheckReport", "DecisionConfig", "HARD_DECISION_FLAGS", "HEAVY_FLAGS",
+    "SOFT_FLAGS", "blocking_flags", "canonical", "check_candidate", "check_candidates",
+    "confidence_for_candidates", "decide",
+]

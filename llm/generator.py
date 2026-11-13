@@ -11,7 +11,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
+from ..formatting.type_inference import infer_question_type
 from .llm_backend import get_backend
+from ..tool.token_budget import reduce_prompt
 
 ANSWER_TYPES = frozenset(
     {"number", "percent", "string", "date", "boolean", "list", "table", "unanswerable"}
@@ -25,6 +27,8 @@ _FORBIDDEN_SQL = re.compile(
     r"read_csv|read_json|read_parquet|reset|set|update|use)\b",
     re.IGNORECASE,
 )
+_LAST_GENERATION_STATS: dict[str, Any] = {}
+_LAST_GENERATION_OOM = False
 
 
 @dataclass
@@ -40,6 +44,10 @@ class Candidate:
     canon: str | None = None
     reason: str | None = None
     raw: str | None = None
+    abstain_reason: str | None = None
+    declared_type: str | None = None
+    inferred_type: str | None = None
+    type_source: str = "none"
 
 
 def _clean_sql(sql: str) -> str:
@@ -48,10 +56,26 @@ def _clean_sql(sql: str) -> str:
 
 def _parse_details(text: str) -> tuple[str | None, str | None, str | None]:
     type_match = _TYPE_TAG.search(text)
-    sql_match = _SQL_BLOCK.search(text) or _FENCED_SQL.search(text)
+    sql_match = _SQL_BLOCK.search(text)
+    if not sql_match:
+        for fence in re.finditer(r"```([^\n`]*)\n?(.*?)(?:```|$)", text, re.IGNORECASE | re.DOTALL):
+            body = fence.group(2)
+            if re.search(r"\b(?:select|with)\b", body, re.IGNORECASE):
+                sql_match = fence
+                break
     reason_match = _REASON_TAG.search(text)
     answer_type = type_match.group(1).strip().lower() if type_match else None
-    sql = _clean_sql(sql_match.group(1)) if sql_match else None
+    if sql_match:
+        body = sql_match.group(1) if sql_match.re is _SQL_BLOCK else sql_match.group(2)
+        sql = _clean_sql(body)
+    else:
+        fallback = re.search(r"\b(?:select|with)\b[\s\S]*", text, re.IGNORECASE)
+        if fallback:
+            tail = fallback.group(0).split("```", 1)[0]
+            statement_end = tail.find(";")
+            sql = _clean_sql(tail[:statement_end + 1] if statement_end >= 0 else tail)
+        else:
+            sql = None
     reason = reason_match.group(1).strip() if reason_match else None
     return answer_type, sql, reason
 
@@ -72,17 +96,21 @@ def parse_response(text: str) -> tuple[str | None, str | None]:
 
 def _candidate_from_response(text: str) -> Candidate:
     if not isinstance(text, str) or not text.strip():
-        return Candidate(None, "invalid", error="Empty LLM response", flags=["PARSE_ERROR"], raw=text)
+        return Candidate(None, "invalid", error="Empty LLM response", flags=["PARSE_ERROR"],
+                         raw=text, abstain_reason="no_sql_found")
 
     answer_type, sql, reason = _parse_details(text)
-    if answer_type not in ANSWER_TYPES:
+    declared_type = answer_type
+    if not sql:
         return Candidate(
-            sql,
+            None,
             answer_type or "invalid",
-            error="Missing or invalid <type> tag",
+            error="No SQL found",
             flags=["PARSE_ERROR"],
             reason=reason,
             raw=text,
+            abstain_reason="no_sql_found",
+            declared_type=declared_type,
         )
     if answer_type == "unanswerable":
         if sql:
@@ -92,25 +120,37 @@ def _candidate_from_response(text: str) -> Candidate:
                 error="unanswerable response must not contain SQL",
                 flags=["PARSE_ERROR"],
                 reason=reason,
-                raw=text,
+                raw=text, declared_type=declared_type,
             )
-        return Candidate(None, answer_type, reason=reason, raw=text)
-    if not sql:
-        return Candidate(
-            None,
-            answer_type,
-            error="Missing <sql> tag",
-            flags=["PARSE_ERROR"],
-            reason=reason,
-            raw=text,
-        )
+        return Candidate(None, answer_type, reason=reason, raw=text, declared_type=declared_type)
+    if answer_type not in ANSWER_TYPES:
+        answer_type = "invalid"
 
     flags: list[str] = []
+    if sql.count("(") != sql.count(")") or sql.count("'") % 2 or sql.count('"') % 2:
+        flags.append("PARSE_ERROR")
+    if re.search(r"(?:\bfrom|\bjoin|\bwhere|\band|\bor|,|=)\s*$", sql, re.IGNORECASE):
+        flags.append("PARSE_ERROR")
     if _FORBIDDEN_SQL.search(sql) or not re.match(r"^(?:select|with)\b", sql, re.IGNORECASE):
         flags.append("UNSAFE_SQL")
     if sql.count(";"):
         flags.append("MULTI_STATEMENT")
-    return Candidate(sql, answer_type, flags=flags, reason=reason, raw=text)
+    return Candidate(sql, answer_type, flags=flags, reason=reason, raw=text, declared_type=declared_type)
+
+
+def resolve_candidate_type(candidate: Candidate, question: str) -> Candidate:
+    inferred, confidence = infer_question_type(question)
+    candidate.inferred_type = inferred if confidence >= 0.6 else None
+    if candidate.inferred_type:
+        candidate.answer_type = candidate.inferred_type
+        candidate.type_source = "question"
+    elif candidate.declared_type in ANSWER_TYPES:
+        candidate.answer_type = candidate.declared_type
+        candidate.type_source = "model"
+    else:
+        candidate.answer_type = "invalid" if candidate.declared_type else "undetermined"
+        candidate.type_source = "none"
+    return candidate
 
 
 def _messages(prompt_or_messages: str | Sequence[Mapping[str, str]]) -> list[dict[str, str]]:
@@ -128,12 +168,53 @@ def _messages(prompt_or_messages: str | Sequence[Mapping[str, str]]) -> list[dic
 
 
 def _generate(backend: Any, messages: list[dict[str, str]], count: int, temperature: float, seed: int | None) -> list[str]:
-    outputs = backend.generate(
-        messages, n=count, temperature=temperature, max_tokens=256, seed=seed
+    global _LAST_GENERATION_OOM, _LAST_GENERATION_STATS
+    import os
+    kwargs = dict(
+        n=count, temperature=temperature,
+        max_tokens=int(os.getenv("LLM_MAX_NEW_TOKENS", "512")), seed=seed
     )
+    _LAST_GENERATION_OOM = False
+    try:
+        outputs = backend.generate(messages, **kwargs)
+    except Exception as error:
+        import torch
+        if not isinstance(error, torch.cuda.OutOfMemoryError):
+            raise
+        torch.cuda.empty_cache()
+        current_tokens = getattr(backend, "last_prompt_tokens", None) or reduced_tokens_for_retry(
+            messages[-1]["content"]
+        )
+        reduced, _, reduced_tokens = reduce_prompt(
+            messages[-1]["content"], max(1, int(current_tokens * 0.6))
+        )
+        retry_messages = [*messages[:-1], {**messages[-1], "content": reduced}]
+        try:
+            outputs = backend.generate(retry_messages, **kwargs)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            _LAST_GENERATION_OOM = True
+            outputs = []
+    current_stats = {
+        "prompt_tokens": getattr(backend, "last_prompt_tokens", reduced_tokens if "reduced_tokens" in locals() else None),
+        "peak_gpu_memory": getattr(backend, "last_peak_memory", None),
+    }
+    previous_peak = _LAST_GENERATION_STATS.get("peak_gpu_memory")
+    if previous_peak is not None and current_stats["peak_gpu_memory"] is not None:
+        current_stats["peak_gpu_memory"] = max(previous_peak, current_stats["peak_gpu_memory"])
+    _LAST_GENERATION_STATS = current_stats
     if not isinstance(outputs, list):
         raise TypeError("LLM backend generate() must return list[str]")
     return [output for output in outputs if isinstance(output, str)]
+
+
+def reduced_tokens_for_retry(prompt: str) -> int:
+    from ..tool.token_budget import prompt_token_count
+    return prompt_token_count(prompt)
+
+
+def generation_stats() -> dict[str, Any]:
+    return dict(_LAST_GENERATION_STATS)
 
 
 def generate_candidates(
@@ -155,7 +236,10 @@ def generate_candidates(
         raise ValueError("k must be a positive integer")
     messages = _messages(prompt_or_messages)
     model = backend or get_backend()
+    _LAST_GENERATION_STATS.clear()
     outputs = _generate(model, messages, 1, 0.0, seed)
+    if _LAST_GENERATION_OOM:
+        return [Candidate(None, "invalid", error="GPU out of memory", flags=["OOM"], abstain_reason="oom")]
     if k > 1:
         outputs.extend(_generate(model, messages, k - 1, 0.4, seed))
     return [_candidate_from_response(output) for output in outputs[:k]]
@@ -173,4 +257,8 @@ def generate(
     return generate_candidates(prompt_or_messages, k, seed=seed, backend=backend)
 
 
-__all__ = ["ANSWER_TYPES", "Candidate", "generate", "generate_candidates", "parse_response"]
+__all__ = [
+    "ANSWER_TYPES", "Candidate", "generate", "generate_candidates",
+    "parse_response", "resolve_candidate_type",
+    "generation_stats",
+]

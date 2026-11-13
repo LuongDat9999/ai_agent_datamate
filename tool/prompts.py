@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -28,6 +29,9 @@ Dùng TRY_CAST cho dữ liệu bẩn, ILIKE/vn_norm cho tên không dấu, date_
 cho ngày. Percent phải nhân 100. Aggregate trước khi JOIN để tránh fan-out. Ranking
 phải có tie-breaker ổn định. Phân biệt doanh thu, tiền đã thu, tiền phải trả, số đơn
 và số dòng hàng.
+Ưu tiên view _line_* cho phép tính cấp dòng và view _order_* cho số đơn/đơn cấp đơn.
+Dùng vai trò cột và MEASURES trong schema; không tự thêm bộ lọc theo từ trong câu hỏi
+nếu từ đó không có trong gợi ý thực thể hoặc luật nghiệp vụ.
 
 [ĐẦU RA]
 <thinking>Tối đa 5 dòng: bảng, cột, bộ lọc, đơn vị, thứ tự.</thinking>
@@ -96,6 +100,89 @@ def _fewshot_text(fewshots: Iterable[Mapping[str, Any]]) -> str:
     return "\n\n".join(blocks) or "(không có)"
 
 
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _profile_fewshots(tables: Mapping[str, Any]) -> list[dict[str, str]]:
+    candidates = []
+    for table, profile in tables.items():
+        columns = getattr(profile, "columns", {})
+        roles = getattr(profile, "roles", {})
+        measures = getattr(profile, "measures", {})
+        date = "ngay" if "ngay" in columns else next(
+            (column for column, info in roles.items() if info.get("role") == "event_date"), None
+        )
+        money = measures.get("revenue")
+        if money == "unknown":
+            money = next(
+                (column for column, info in roles.items() if info.get("role") == "line_amount"), None
+            )
+        order = next(
+            (column for column, info in roles.items() if info.get("role") == "order_key"), None
+        )
+        group = next(
+            (column for column, info in roles.items() if info.get("role") == "entity"), None
+        )
+        if date and money and order:
+            candidates.append((table, date, money, order, group, "trang_thai_chuan" in columns))
+    if not candidates:
+        return []
+    table, date, money, order, group, has_status = candidates[0]
+    table_sql = _quote_identifier(table)
+    date_sql, money_sql, order_sql = map(_quote_identifier, (date, money, order))
+    status_filter = (
+        " AND (\"trang_thai_chuan\" IS NULL OR \"trang_thai_chuan\" NOT IN ('huy', 'tra_hang'))"
+        if has_status else ""
+    )
+    examples = [
+        {
+            "question": "Tổng doanh thu một kỳ",
+            "type": "number",
+            "sql": (
+                f"SELECT SUM({money_sql}) AS doanh_thu FROM {table_sql} "
+                f"WHERE {date_sql} BETWEEN DATE 'a' AND DATE 'b'{status_filter}"
+            ),
+        },
+        {
+            "question": "Số đơn một kỳ",
+            "type": "number",
+            "sql": (
+                f"SELECT COUNT(DISTINCT {order_sql}) AS so_don FROM {table_sql} "
+                f"WHERE {date_sql} BETWEEN DATE 'a' AND DATE 'b'{status_filter}"
+            ),
+        },
+    ]
+    if group:
+        group_sql = _quote_identifier(group)
+        examples.append(
+            {
+                "question": "Top N theo nhóm",
+                "type": "table",
+                "sql": (
+                    f"SELECT {group_sql}, SUM({money_sql}) AS doanh_thu FROM {table_sql} "
+                    f"WHERE {date_sql} BETWEEN DATE 'a' AND DATE 'b'{status_filter} "
+                    f"GROUP BY {group_sql} ORDER BY doanh_thu DESC LIMIT N"
+                ),
+            }
+        )
+    return examples
+
+
+def _sample_rows_text(tables: Mapping[str, Any]) -> str:
+    blocks = []
+    for name, profile in tables.items():
+        rows = getattr(profile, "sample_rows", ())
+        if not rows:
+            continue
+        clipped = [
+            {str(key): str(value)[:30] if value is not None else None for key, value in row.items()}
+            for row in rows[:3]
+        ]
+        blocks.append(f"{name}: {json.dumps(clipped, ensure_ascii=False, separators=(',', ':'))}")
+    return "\n".join(blocks)
+
+
 def _estimate_tokens(text: str) -> int:
     return prompt_token_count(text)
 
@@ -126,7 +213,7 @@ def _compact_schema(schema: str, *, drop_raw: bool = False, related_only: bool =
             current.append(line)
     if current and keep:
         out.extend(current)
-    return "\n".join(out)
+    return "\n".join(out) or schema
 
 
 def _rulebook_core() -> str:
@@ -169,6 +256,22 @@ def _minimal_schema(schema: str) -> str:
     return "\n".join(lines)
 
 
+def _assert_schema_columns(schema: str, business_context: Any) -> None:
+    profiles = _value(business_context, "tables", {})
+    current_table = None
+    for line in schema.splitlines():
+        if line.startswith("TABLE "):
+            current_table = line.split()[1]
+            assert current_table in profiles, f"Prompt table missing from context: {current_table}"
+            continue
+        if current_table is None or not line.lstrip().startswith("- "):
+            continue
+        column = line.strip()[2:].split(":", 1)[0].strip()
+        assert column in profiles[current_table].columns, (
+            f"Prompt column missing from {current_table}: {column}"
+        )
+
+
 def build_prompt(
     question: str,
     as_of_date: str,
@@ -184,6 +287,7 @@ def build_prompt(
     resolved = resolve_time(question, as_of_date, calendar=calendar, rulebook=rulebook)
     hints = match_entities(question, _value(business_context, "entity_index", {}))
     schema, truncated = _schema_for_question(_value(business_context, "schema_prompt", ""), question, hints, max_schema_chars)
+    _assert_schema_columns(schema, business_context)
     warnings = list(resolved["warnings"])
     if truncated:
         warnings.append("SCHEMA_TRUNCATED")
@@ -192,7 +296,7 @@ def build_prompt(
         as_of_date=as_of_date,
         periods=resolved["periods"],
         entity_hints=hints,
-        fewshots=list(fewshots),
+        fewshots=[],
         local_rules=rulebook,
         normalized_question=expanded["normalized_question"],
         warnings=warnings,
@@ -202,20 +306,19 @@ def build_prompt(
     core_rules = _rulebook_core()
     industry_rules = _industry_section(rulebook)
     status_rules = _value(business_context, "status_prompt", "")
-    max_tokens = prompt_budget() - prompt_margin()
+    tables = _value(business_context, "tables", {})
+    context.fewshots = _profile_fewshots(tables)
+    max_tokens = min(3500, prompt_budget() - prompt_margin())
     if max_tokens < 1:
         raise ValueError("MAX_PROMPT_TOKENS must be greater than PROMPT_TOKEN_MARGIN")
     steps: list[str] = []
-    sample_rows = "\n".join(
-        f"{name}: {profile.sample_rows}" for name, profile in _value(business_context, "tables", {}).items()
-        if getattr(profile, "sample_rows", None)
-    )
+    sample_rows = _sample_rows_text(tables)
     schema_options = schema
     fewshot_options = context.fewshots
 
     def render() -> str:
         return f"""{SYSTEM_PROMPT}
-[LUẬT CÒN LẠI]
+[LUẬT]
 {core_rules or "(không có)"}
 
 [THEO NGÀNH]
@@ -255,24 +358,21 @@ warnings: {context.warnings}
         return _estimate_tokens(render()) > max_tokens
 
     if over_budget():
-        schema_options = _compact_schema(schema_options)
-        steps.append("limit_distinct_values")
-    if over_budget():
-        sample_rows = "\n".join(
-            f"{name}: {profile.sample_rows[:2]}" for name, profile in _value(business_context, "tables", {}).items()
-            if getattr(profile, "sample_rows", None)
-        )
-        steps.append("limit_sample_rows")
-    if over_budget():
-        schema_options = _compact_schema(schema_options, drop_raw=True)
-        steps.append("drop_raw_columns")
-    if over_budget():
         readme = _compact_readme(readme)
         steps.append("compact_readme")
     if over_budget():
         sample_rows = ""
         fewshot_options = []
         steps.append("remove_optional_examples")
+    if over_budget():
+        sample_rows = "(không có)"
+        steps.append("remove_sample_rows")
+    if over_budget():
+        schema_options = _compact_schema(
+            schema_options, drop_raw=True, related_only=True,
+            question=question, hints=hints,
+        )
+        steps.append("compact_unrelated_schema_columns")
     if over_budget():
         schema_options = _minimal_schema(schema_options)
         steps.append("keep_schema_headers_only")
@@ -286,10 +386,16 @@ warnings: {context.warnings}
     if context.prompt_over_budget:
         context.warnings.append("PROMPT_OVER_BUDGET")
     context.prompt_part_tokens = {
+        "system": _estimate_tokens(SYSTEM_PROMPT),
         "luat": _estimate_tokens(core_rules),
         "muc_6": _estimate_tokens(industry_rules),
+        "status": _estimate_tokens(status_rules),
+        "capabilities": _estimate_tokens(str(capabilities)),
         "readme": _estimate_tokens(readme),
         "schema": _estimate_tokens(schema_options),
+        "sample_rows": _estimate_tokens(sample_rows),
+        "fewshots": _estimate_tokens(_fewshot_text(fewshot_options)),
+        "periods": _estimate_tokens(str(context.periods) + str(context.warnings)),
         "hint": _estimate_tokens(format_entity_hints(hints)),
         "question": _estimate_tokens(question),
     }

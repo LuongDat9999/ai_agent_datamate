@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from typing import Any, Mapping, Sequence
 
@@ -47,11 +48,35 @@ def prompt_token_count(prompt: str) -> int:
 
 
 def prompt_budget() -> int:
-    return int(os.getenv("MAX_PROMPT_TOKENS", "6000"))
+    return int(os.getenv("PROMPT_MAX_TOKENS", "4500"))
 
 
 def prompt_margin() -> int:
     return max(0, int(os.getenv("PROMPT_TOKEN_MARGIN", "128")))
 
 
-__all__ = ["chat_token_count", "load_tokenizer", "prompt_budget", "prompt_margin", "prompt_token_count"]
+def reduce_prompt(prompt: str, target_tokens: int) -> tuple[str, list[str], int]:
+    """Reuse the prompt reduction order for a retry after a GPU OOM."""
+    sections = {
+        "sample_rows": r"(?ms)\[SAMPLE ROWS\].*?(?=^\[VÍ DỤ TƯƠNG TỰ\])",
+        "fewshots": r"(?ms)\[VÍ DỤ TƯƠNG TỰ\].*?(?=^\[KHOẢNG THỜI GIAN ĐÃ GIẢI MÃ\])",
+        "readme": r"(?ms)(README:\n).*?(?=^\n\[SCHEMA DUCKDB\])",
+        "status": r"(?ms)(\[TRẠNG THÁI\]\n).*?(?=^\n\[DOANH NGHIỆP\])",
+        "schema": r"(?ms)\[SCHEMA DUCKDB\].*?(?=^\n\[SAMPLE ROWS\])",
+    }
+    reduced = prompt
+    steps: list[str] = []
+    for name in ("sample_rows", "fewshots", "readme", "status", "schema"):
+        if prompt_token_count(reduced) <= target_tokens:
+            break
+        replacement = "\n" if name != "schema" else "[SCHEMA DUCKDB]\n(schema đã rút gọn)\n"
+        reduced, count = re.subn(sections[name], replacement, reduced, count=1)
+        if count:
+            steps.append(f"oom_{name}")
+    return reduced, steps, prompt_token_count(reduced)
+
+
+__all__ = [
+    "chat_token_count", "load_tokenizer", "prompt_budget", "prompt_margin",
+    "prompt_token_count", "reduce_prompt",
+]

@@ -20,6 +20,11 @@ FORBIDDEN_WORDS = re.compile(
     r"read_csv|read_json|read_parquet|reset|set|update|use)\b",
     re.IGNORECASE,
 )
+FORBIDDEN_TIME_FUNCS = re.compile(
+    r"\bcurrent_date\b|\bcurrent_timestamp\b|\bnow\s*\(|\btoday\s*\(",
+    re.IGNORECASE,
+)
+_MYSQL_DATE_FUNCS = re.compile(r"\b(?:date_sub|date_add)\b", re.IGNORECASE)
 HARD_FLAGS = frozenset({"UNSAFE_SQL", "MULTI_STATEMENT", "CARTESIAN", "RAW_TABLE"})
 
 
@@ -41,6 +46,63 @@ def _closest(name: str, names: Iterable[str]) -> str:
     return ", ".join(matches) if matches else "(không có)"
 
 
+def _subtree_table_names(node: Any) -> set[str]:
+    """Collect lowercased table names referenced under *node*."""
+    if exp is None or node is None:
+        return set()
+    return {table.name.lower() for table in node.find_all(exp.Table)}
+
+
+def _is_single_row_select(query: Any) -> bool:
+    """Return True when *query* is an aggregate SELECT without GROUP BY."""
+    if not isinstance(query, exp.Select):
+        return False
+    if query.args.get("group") is not None:
+        return False
+    return query.find(exp.AggFunc) is not None
+
+
+def _single_row_ctes(tree: Any) -> set[str]:
+    """Names of CTEs guaranteed to return exactly one row."""
+    result: set[str] = set()
+    if exp is None:
+        return result
+    for cte in tree.find_all(exp.CTE):
+        if cte.alias and _is_single_row_select(cte.this):
+            result.add(str(cte.alias).lower())
+    return result
+
+
+def _blocking_cartesian(tree: Any, single_row_ctes: set[str]) -> bool:
+    """Return True when a cross/comma join touches any non-single-row relation."""
+    if exp is None:
+        return False
+    for select in tree.find_all(exp.Select):
+        from_ = select.args.get("from_")
+        if from_ is None:
+            continue
+        left = _subtree_table_names(from_.this)
+        for join in select.args.get("joins") or []:
+            right = _subtree_table_names(join.this)
+            if join.args.get("on") is None and not (left | right) <= single_row_ctes:
+                return True
+            left |= right
+    return False
+
+
+def _normalize_mysql_dates(sql: str) -> str:
+    """Rewrite MySQL-style date_sub/date_add into DuckDB INTERVAL arithmetic."""
+    if sqlglot is None or not isinstance(sql, str) or not _MYSQL_DATE_FUNCS.search(sql):
+        return sql
+    try:
+        rewritten = sqlglot.transpile(sql, read="mysql", write="duckdb")
+    except Exception:
+        return sql
+    if not rewritten or not rewritten[0].strip():
+        return sql
+    return rewritten[0].strip()
+
+
 def static_check(sql: str, ctx: Any) -> tuple[list[str], list[str]]:
     """Return hard errors and semantic flags without executing *sql*."""
     errors: list[str] = []
@@ -49,6 +111,11 @@ def static_check(sql: str, ctx: Any) -> tuple[list[str], list[str]]:
         return ["SQL rỗng"], flags
     if FORBIDDEN_WORDS.search(sql):
         errors.append("Chỉ cho phép SELECT; SQL chứa lệnh hoặc hàm bị cấm")
+    if FORBIDDEN_TIME_FUNCS.search(sql):
+        errors.append(
+            "Không được dùng ngày/giờ hiện tại (current_date, current_timestamp, now(), today()); "
+            "hãy dùng ngày literal DATE 'YYYY-MM-DD' từ periods đã giải mã"
+        )
     if ";" in sql.rstrip().rstrip(";"):
         flags.append("MULTI_STATEMENT")
         errors.append("Chỉ được một câu lệnh SELECT")
@@ -87,8 +154,7 @@ def static_check(sql: str, ctx: Any) -> tuple[list[str], list[str]]:
         if name.endswith("_raw"):
             flags.append("RAW_TABLE")
             errors.append("Không được truy cập bảng raw")
-    joins = list(tree.find_all(exp.Join))
-    if any(join.args.get("on") is None for join in joins) or re.search(r"\bcross\s+join\b", sql, re.IGNORECASE):
+    if _blocking_cartesian(tree, _single_row_ctes(tree)):
         flags.append("CARTESIAN")
         errors.append("JOIN phải có điều kiện")
     return errors, flags
@@ -99,16 +165,58 @@ def semantic_lint(sql: str, ctx: Any, question: str = "") -> list[str]:
     flags: list[str] = []
     normalized_question = question.lower()
     profiles = getattr(ctx, "tables", {}) or {}
-    if re.search(r"\b(ngày|ngay|tuần|tuan|tháng|thang|quý|quy|năm|nam|hôm qua|hom qua)\b", normalized_question):
-        if not re.search(r"\b(ngay|date|thoi_gian|timestamp)\b", sql, re.IGNORECASE):
+    date_columns = {
+        column for profile in profiles.values()
+        for column, info in profile.columns.items()
+        if profile.roles.get(column, {}).get("role") == "event_date"
+    }
+    status_columns = {
+        column for profile in profiles.values()
+        for column, info in profile.columns.items()
+        if profile.roles.get(column, {}).get("role") == "status"
+    }
+    has_time_intent = bool(re.search(
+        r"\b(ngày|ngay|tuần|tuan|tháng|thang|quý|quy|năm|nam|"
+        r"hôm qua|hom qua|hôm nay|hom nay|hqua|hnay|bữa|bua)\b"
+        r"|\bngày\s+\d+",
+        normalized_question,
+    ))
+    if has_time_intent:
+        if date_columns and not any(re.search(rf"\b{re.escape(column)}\b", sql, re.IGNORECASE) for column in date_columns):
             flags.append("NO_DATE_FILTER")
-    if re.search(r"\b(doanh thu|doanhthu|đơn|don|bán|ban|tiền|tien)\b", normalized_question):
-        has_status = any(
-            any("trang_thai" in str(column).lower() or "status" in str(column).lower() for column in profile.columns)
-            for profile in profiles.values()
-        )
-        if has_status and not re.search(r"\b(trang_thai|status)\b", sql, re.IGNORECASE):
+    state_specific = bool(re.search(r"\b(hủy|huỷ|huy|trả hàng|tra hang|trả lại|tra lai)\b", normalized_question))
+    unrelated_to_orders = bool(re.search(
+        r"\b(công nợ|cong no|tồn kho|ton kho|đơn giá|don gia)\b", normalized_question,
+    ))
+    order_related = bool(re.search(
+        r"\b(đơn|don|doanh thu|doanh so|bán|ban)\b", normalized_question,
+    ))
+    status_columns = set(status_columns) | {"trang_thai_chuan"}
+    if not state_specific and order_related and not unrelated_to_orders and status_columns:
+        safe_view = any(name.lower().startswith("_line_") or name.lower().endswith("_hop_le") for name in re.findall(r"\b(?:from|join)\s+([a-zA-Z_][\w]*)", sql, re.IGNORECASE))
+        if not safe_view and not any(re.search(rf"\b{re.escape(column)}\b", sql, re.IGNORECASE) for column in status_columns):
             flags.append("NO_STATUS_FILTER")
+    if re.search(r"\b(đơn|don)\b", normalized_question):
+        used_tables = {name.lower() for name in re.findall(r"\b(?:from|join)\s+([a-zA-Z_][\w]*)", sql, re.IGNORECASE)}
+        for name, profile in profiles.items():
+            if name.lower() not in used_tables or profile.grain != "line":
+                continue
+            order_keys = {
+                column.lower() for column, info in profile.roles.items()
+                if info.get("role") == "order_key"
+            }
+            count_expressions = re.findall(r"\bcount\s*\(\s*(.*?)\s*\)", sql, re.IGNORECASE)
+            for expression in count_expressions:
+                expression = expression.strip().strip('"').lower()
+                if expression == "*" or (
+                    expression.startswith("distinct ")
+                    and expression.removeprefix("distinct ").strip() not in order_keys
+                ) or (
+                    not expression.startswith("distinct ")
+                    and expression not in order_keys
+                ):
+                    flags.append("LINE_GRAIN_ORDER_METRIC")
+                    break
     if re.search(r"\bjoin\b", sql, re.IGNORECASE) and re.search(r"\b(sum|avg|count)\s*\(", sql, re.IGNORECASE):
         if not re.search(r"\b(count\s*\(\s*distinct|group\s+by)\b", sql, re.IGNORECASE):
             flags.append("FANOUT_RISK")
@@ -206,6 +314,7 @@ def validate_candidate(
         candidate.error = candidate.error or "Missing SQL"
         candidate.flags.append("PARSE_ERROR")
         return candidate
+    candidate.sql = _normalize_mysql_dates(candidate.sql)
     errors, flags = static_check(candidate.sql, ctx)
     candidate.flags.extend(flag for flag in flags if flag not in candidate.flags)
     candidate.flags.extend(flag for flag in semantic_lint(candidate.sql, ctx, question) if flag not in candidate.flags)

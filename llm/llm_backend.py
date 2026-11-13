@@ -1,5 +1,6 @@
 # src/llm_backend.py
 import os, re, json, hashlib, time
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 from abc import ABC, abstractmethod
 from pathlib import Path
 from functools import lru_cache
@@ -75,6 +76,8 @@ class CachedBackend(LLMBackend):
         f = self.dir / f"{key}.json"
         if f.exists(): return json.loads(f.read_text())
         outs = self.inner.generate(messages, n, temperature, max_tokens, seed)
+        self.last_prompt_tokens = getattr(self.inner, "last_prompt_tokens", None)
+        self.last_peak_memory = getattr(self.inner, "last_peak_memory", None)
         f.write_text(json.dumps(outs, ensure_ascii=False)); return outs
 
 def get_backend():
@@ -91,19 +94,22 @@ class HFBackend(LLMBackend):
         import torch
         from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
         self.model_id = os.getenv("HF_MODEL", "Qwen/Qwen3-14B")
-        quant = os.getenv("HF_QUANT", "nf4").lower()          # nf4 | int8
+        quant_enabled = os.getenv("LLM_4BIT", "1") == "1"
+        quant = "nf4" if quant_enabled else os.getenv("HF_QUANT", "nf4").lower()
         self.thinking = os.getenv("HF_THINKING", "0") == "1"
-        self.max_prompt_tokens = int(os.getenv("MAX_PROMPT_TOKENS", "6000"))
-        self.name = f"hf:{self.model_id}:{quant}:think={int(self.thinking)}"
+        self.max_prompt_tokens = int(os.getenv("PROMPT_MAX_TOKENS", "4500"))
+        self.name = f"hf:{self.model_id}:{quant if quant_enabled else 'fp16'}:think={int(self.thinking)}"
 
-        if quant == "int8":
+        if quant_enabled and quant == "int8":
             qcfg = BitsAndBytesConfig(load_in_8bit=True, llm_int8_threshold=6.0)
-        elif quant == "nf4":
+        elif quant_enabled and quant == "nf4":
             qcfg = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
                                       bnb_4bit_compute_dtype=torch.float16,
                                       bnb_4bit_use_double_quant=True)
-        else:
+        elif quant_enabled:
             raise ValueError(f"HF_QUANT không hợp lệ: {quant}")
+        else:
+            qcfg = None
 
         n_gpu = torch.cuda.device_count()
         # chừa chỗ cho KV cache/activation: mỗi GPU tối đa 11GiB cho trọng số
@@ -114,7 +120,17 @@ class HFBackend(LLMBackend):
             device_map="auto", max_memory=max_memory, low_cpu_mem_usage=True,
             attn_implementation="sdpa")
         self.model.eval()
-        print(f"[HFBackend] {self.name} đã nạp trên {n_gpu} GPU", flush=True)
+        memory = ", ".join(
+            f"gpu{i}:allocated={torch.cuda.memory_allocated(i) / 2**30:.2f}GiB,"
+            f"reserved={torch.cuda.memory_reserved(i) / 2**30:.2f}GiB"
+            for i in range(n_gpu)
+        )
+        print(
+            f"[HFBackend] {self.name} đã nạp trên {n_gpu} GPU "
+            f"dtype=float16 quantization={'nf4' if quant_enabled and quant == 'nf4' else ('int8' if quant_enabled else 'none')} "
+            f"memory=[{memory}]",
+            flush=True,
+        )
 
     def generate(self, messages, n=1, temperature=0.0, max_tokens=800, seed=None):
         import torch
@@ -124,6 +140,9 @@ class HFBackend(LLMBackend):
                                             enable_thinking=self.thinking)
         inputs = self.tok(text, return_tensors="pt")
         n_in = int(inputs["input_ids"].shape[-1])
+        self.last_prompt_tokens = n_in
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         print(f"[HFBackend] prompt={n_in} tok", flush=True)
         if n_in > self.max_prompt_tokens:
             raise ValueError(f"prompt có {n_in} token, vượt MAX_PROMPT_TOKENS={self.max_prompt_tokens}")
@@ -142,10 +161,16 @@ class HFBackend(LLMBackend):
                 out = self.model.generate(**inputs, **kw)
         except torch.cuda.OutOfMemoryError as error:
             torch.cuda.empty_cache()
-            raise RuntimeError(f"OOM với prompt={n_in} token") from error
+            self.last_peak_memory = (
+                torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+            )
+            raise
         texts = [self.tok.decode(g[n_in:], skip_special_tokens=True) for g in out]
         texts = [self._strip_think(t) for t in texts]
         torch.cuda.empty_cache()
+        self.last_peak_memory = (
+            torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else 0.0
+        )
         print(f"[HFBackend] prompt={n_in} tok, n={n}, {time.time()-t0:.1f}s", flush=True)
         return texts * n if greedy else texts   # greedy thì các mẫu giống nhau, khỏi sinh lại
 
@@ -166,6 +191,8 @@ class CachedBackend(LLMBackend):
         f = self.dir / f"{key}.json"
         if f.exists(): return json.loads(f.read_text())
         outs = self.inner.generate(messages, n, temperature, max_tokens, seed)
+        self.last_prompt_tokens = getattr(self.inner, "last_prompt_tokens", None)
+        self.last_peak_memory = getattr(self.inner, "last_peak_memory", None)
         f.write_text(json.dumps(outs, ensure_ascii=False)); return outs
 
 

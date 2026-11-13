@@ -17,6 +17,11 @@ class TableProfile:
     columns: dict[str, dict[str, Any]]
     sample_rows: list[dict[str, Any]]
     source_files: list[str] = field(default_factory=list)
+    grain: str = "unknown"
+    grain_confidence: float = 0.0
+    roles: dict[str, dict[str, Any]] = field(default_factory=dict)
+    measures: dict[str, str] = field(default_factory=dict)
+    semantic_notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -38,6 +43,99 @@ def profile_table(name: str, frame: pd.DataFrame) -> TableProfile:
     sources = frame["_nguon_file"].dropna().astype(str).unique().tolist() if "_nguon_file" in frame else []
     sample = frame.head(3).where(pd.notna(frame.head(3)), None).to_dict("records")
     return TableProfile(name, len(frame), columns, sample, sources)
+
+
+def _role_name(column: str) -> str:
+    return vn_norm(column)
+
+
+def infer_table_semantics(frame: pd.DataFrame) -> dict[str, Any]:
+    """Infer reusable semantic metadata from names, types, repetition and arithmetic."""
+    columns = [
+        str(column) for column in frame.columns
+        if not str(column).startswith("_") and str(column) != "is_total"
+    ]
+    normalized = {column: _role_name(column) for column in columns}
+    roles: dict[str, dict[str, Any]] = {}
+
+    def assign(column: str, role: str, confidence: float, evidence: str) -> None:
+        current = roles.get(column)
+        if current is None or confidence > current["confidence"]:
+            roles[column] = {"role": role, "confidence": round(confidence, 3), "evidence": evidence}
+
+    for column in columns:
+        name = normalized[column]
+        if any(token in name for token in ("ma don", "so don", "id don", "hoa don", "invoice", "order id")):
+            distinct_ratio = frame[column].nunique(dropna=True) / max(frame[column].notna().sum(), 1)
+            assign(column, "order_key", 0.9 if distinct_ratio < 0.95 else 0.65, "fuzzy identifier name and distinctness")
+        if any(token in name for token in ("ngay", "date", "time", "thoi gian")):
+            assign(column, "event_date", 0.85, "fuzzy date name")
+        if any(token in name for token in ("trang thai", "status", "ket qua", "state")):
+            assign(column, "status", 0.85, "fuzzy status name")
+        if any(token in name for token in ("ten", "name", "san pham", "hang", "noi dung", "khach", "customer")):
+            assign(column, "entity", 0.75, "fuzzy entity name")
+        if any(token in name for token in ("so luong", "quantity", "qty", "sl")):
+            assign(column, "quantity", 0.8, "fuzzy quantity name")
+        if any(token in name for token in ("quy ra", "he so", "ti le", "ty le", "factor", "conversion")):
+            assign(column, "conversion_factor", 0.8, "fuzzy conversion name")
+        if any(token in name for token in ("don gia", "unit price", "gia ban", "gia san pham", "price")):
+            assign(column, "unit_price", 0.8, "fuzzy unit-price name")
+        if any(token in name for token in ("thanh tien", "tong tien", "amount", "total", "revenue")):
+            assign(column, "line_amount", 0.8, "fuzzy amount name")
+
+    numeric = [column for column in columns if pd.api.types.is_numeric_dtype(frame[column])]
+    quantities = [column for column, info in roles.items() if info["role"] == "quantity" and column in numeric]
+    prices = [column for column, info in roles.items() if info["role"] == "unit_price" and column in numeric]
+    amounts = [column for column, info in roles.items() if info["role"] == "line_amount" and column in numeric]
+    for price in prices:
+        for quantity in quantities:
+            for amount in amounts:
+                sample = frame[[price, quantity, amount]].dropna()
+                if sample.empty:
+                    continue
+                relative = ((sample[price] * sample[quantity] - sample[amount]).abs() /
+                            sample[amount].abs().clip(lower=1))
+                ratio = float((relative <= 0.01).mean())
+                if ratio >= 0.8:
+                    assign(amount, "line_amount", min(0.99, ratio), f"{price} * {quantity} ≈ {amount}")
+
+    key_candidates = [column for column, info in roles.items() if info["role"] == "order_key"]
+    key = key_candidates[0] if key_candidates else None
+    if key is None:
+        repeated = []
+        for column in columns:
+            non_null = frame[column].dropna()
+            distinct_ratio = frame[column].nunique(dropna=True) / max(len(non_null), 1)
+            inferred_role = roles.get(column, {}).get("role")
+            name_hint = any(token in normalized[column] for token in ("order", "don", "hoa don", "invoice", "code", "id", "ma", "so"))
+            if (
+                distinct_ratio < 0.95
+                and not pd.api.types.is_numeric_dtype(frame[column])
+                and not pd.api.types.is_datetime64_any_dtype(frame[column])
+                and inferred_role not in {"event_date", "status"}
+            ):
+                repeated.append((0 if name_hint else 1, distinct_ratio, column))
+        key = min(repeated)[2] if repeated else None
+        if key:
+            assign(key, "order_key", 0.55, "repeated non-numeric candidate with fallback distinctness")
+    if key:
+        distinct_ratio = frame[key].nunique(dropna=True) / max(frame[key].notna().sum(), 1)
+        grain = "line" if distinct_ratio < 0.95 else "order"
+        grain_confidence = 0.9 if key in key_candidates else 0.55
+    else:
+        grain, grain_confidence = "unknown", 0.0
+    measures = {
+        "order_count": f"COUNT(DISTINCT {key})" if key else "unknown",
+        "revenue": next((column for column in amounts), "unknown"),
+        "base_quantity": next((f"{column} * {next((c for c, info in roles.items() if info['role'] == 'conversion_factor'), '1')}" for column in quantities), "unknown"),
+    }
+    return {
+        "grain": grain,
+        "grain_confidence": grain_confidence,
+        "order_key": key,
+        "roles": roles,
+        "measures": measures,
+    }
 
 
 def build_entity_index(tables: dict[str, pd.DataFrame]) -> EntityIndex:
@@ -81,12 +179,20 @@ def detect_capabilities(tables: dict[str, pd.DataFrame]) -> dict[str, Any]:
 def render_schema(profiles: dict[str, TableProfile]) -> str:
     lines = []
     for name, profile in profiles.items():
-        lines.append(f"TABLE {name} ({profile.row_count} rows)")
+        lines.append(f"TABLE {name} ({profile.row_count} rows; grain={profile.grain}, confidence={profile.grain_confidence:.2f})")
+        if profile.measures:
+            lines.append(f"  MEASURES {profile.measures}")
         for column, info in profile.columns.items():
             detail = f"{info['dtype']}, null={info['null_ratio']:.1%}, distinct={info['distinct']}"
             if "values" in info:
                 detail += f", values={info['values']}"
             if "min" in info:
                 detail += f", range={info['min']}..{info['max']}"
-            lines.append(f"  - {column}: {detail}")
+            role = profile.roles.get(column)
+            role_text = f", role={role['role']} ({role['confidence']:.2f})" if role else ""
+            lines.append(f"  - {column}: {detail}{role_text}")
+        if "ngay" in profile.columns:
+            lines.append("  NOTE: Dùng cột `ngay` cho bộ lọc ngày của bảng này.")
+        for note in profile.semantic_notes:
+            lines.append(f"  NOTE: {note}")
     return "\n".join(lines)

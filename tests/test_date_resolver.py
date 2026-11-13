@@ -51,6 +51,26 @@ class DateResolverTests(unittest.TestCase):
         self.assertEqual(result["periods"]["quarter"]["start"], "2025-10-01")
         self.assertEqual(result["periods"]["quarter"]["end"], "2025-12-31")
 
+    def test_quarter_spelling_variants(self):
+        for question in ("quys 3/2025", "quy 1 nam 2026", "quý 2/2025", "qui 4 nam 2024", "q3/2025"):
+            with self.subTest(question=question):
+                self.assertIn("quarter", resolve(question, "2026-08-24"))
+
+    def test_explicit_month_anchors_previous_period(self):
+        periods = resolve("doanh thu tháng 5/2026 tăng bao nhiêu % so với tháng trước", "2026-08-24")
+        self.assertEqual(periods["target"].as_tuple(), ("2026-05-01", "2026-05-31"))
+        self.assertEqual(periods["compare"].as_tuple(), ("2026-04-01", "2026-04-30"))
+        self.assertNotIn("same_period_last_year", periods)
+
+    def test_explicit_quarter_anchors_previous_quarter_across_year(self):
+        periods = resolve("quý 1/2025 so với quý trước", "2026-08-24")
+        self.assertEqual(periods["target"].as_tuple(), ("2025-01-01", "2025-03-31"))
+        self.assertEqual(periods["compare"].as_tuple(), ("2024-10-01", "2024-12-31"))
+
+    def test_leap_year_same_period_has_half_open_end(self):
+        result = resolve_time("tháng 2/2024", "2025-01-01")
+        self.assertEqual(result["periods"]["month"]["end_exclusive"], "2024-03-01")
+
     def test_period_without_date_filter_abstains(self):
         candidate = Candidate(
             "SELECT COUNT(*) FROM ban_hang", "number", rows=[[1]], columns=["count"],

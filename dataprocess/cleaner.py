@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 import unicodedata
 import warnings
@@ -13,6 +14,7 @@ import pandas as pd
 
 TOTAL_PAT = re.compile(r"^\s*(cộng|tổng cộng|tổng|grand total|total|tổng ngày|cộng ngày|cộng tháng)\b", re.I)
 UNIT = {"k": 1e3, "nghìn": 1e3, "ngàn": 1e3, "ngan": 1e3, "tr": 1e6, "triệu": 1e6, "trieu": 1e6, "tỷ": 1e9, "ty": 1e9}
+PARSE_THRESHOLD = 0.8
 
 
 def vn_norm(value: Any) -> str:
@@ -34,7 +36,12 @@ def unique_column_names(values: Iterable[Any]) -> list[str]:
     return result
 
 
-def parse_plain_number(value: str) -> float | None:
+def parse_plain_number(value: Any) -> float | None:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    value = str(value)
     text = value.replace(" ", "").strip("()-")
     negative = value.strip().startswith("-") or (value.strip().startswith("(") and value.strip().endswith(")"))
     if re.fullmatch(r"\d{1,3}(\.\d{3})+(,\d+)?", text):
@@ -65,6 +72,34 @@ def parse_money(value: Any) -> float | None:
             result += float(f"0.{suffix}") * UNIT[unit]
         return -result if sign else result
     return parse_plain_number(text)
+
+
+def parse_ratio(values: Iterable[Any], parser: Any) -> float:
+    series = list(values)
+    if not series:
+        return 0.0
+    non_empty = [value for value in series if pd.notna(value) and str(value).strip()]
+    if not non_empty:
+        return 0.0
+    return sum(parser(value) is not None for value in non_empty) / len(non_empty)
+
+
+def _parse_threshold() -> float:
+    try:
+        value = float(os.environ.get("DATAPROCESS_PARSE_THRESHOLD", PARSE_THRESHOLD))
+    except ValueError as error:
+        raise ValueError("DATAPROCESS_PARSE_THRESHOLD must be numeric") from error
+    if not 0.0 <= value <= 1.0:
+        raise ValueError("DATAPROCESS_PARSE_THRESHOLD must be between 0 and 1")
+    return value
+
+
+def _looks_like_entity(column: str, values: pd.Series) -> bool:
+    if column.startswith("_") or column == "is_total":
+        return False
+    normalized = vn_norm(column)
+    name_signal = any(token in normalized for token in ("ten", "name", "hang", "san pham", "khach", "customer", "doi tac"))
+    return name_signal or (values.dtype == object and values.nunique(dropna=True) > 1)
 
 
 def infer_date_order(values: Iterable[Any]) -> str:
@@ -140,10 +175,15 @@ def detect_header(frame: pd.DataFrame, max_rows: int = 15) -> int:
         if not values:
             continue
         text_ratio = sum(not isinstance(v, (int, float)) for v in values) / len(values)
-        next_numeric = 0
-        if index + 1 < len(frame):
-            next_numeric = sum(isinstance(v, (int, float)) and not isinstance(v, bool) for v in frame.iloc[index + 1])
-        score = len(values) + 2 * text_ratio + next_numeric / max(len(frame.columns), 1)
+        score = len(values) + 2 * text_ratio
+        if index:
+            following = frame.iloc[index + 1 : min(len(frame), index + 21)]
+            repeated = sum(
+                any(value == candidate for candidate in following.iloc[:, column].tolist())
+                for column, value in enumerate(frame.iloc[index].tolist())
+                if pd.notna(value) and str(value).strip()
+            )
+            score -= repeated / max(len(values), 1)
         if score > best_score:
             best_index, best_score = index, score
     return best_index
@@ -171,6 +211,27 @@ def flag_totals(frame: pd.DataFrame) -> pd.DataFrame:
             continue
         mask |= result[column].astype(str).str.match(TOTAL_PAT, na=False)
     result["is_total"] = mask
+    result["_total_validation"] = "not_applicable"
+    if mask.any():
+        total_rows = result[mask]
+        detail_rows = result[~mask]
+        numeric_columns = [
+            column for column in result.columns
+            if column not in {"is_total", "_total_validation"}
+            and (
+                pd.api.types.is_numeric_dtype(result[column])
+                or parse_ratio(result[column], parse_money) >= _parse_threshold()
+            )
+        ]
+        for column in numeric_columns:
+            detail_sum = pd.Series(detail_rows[column]).map(parse_money).sum(min_count=1)
+            for index in total_rows.index:
+                total_value = parse_money(result.at[index, column])
+                if pd.notna(total_value) and pd.notna(detail_sum):
+                    result.at[index, "_total_validation"] = (
+                        "matches" if math.isclose(float(total_value), float(detail_sum), rel_tol=0.01, abs_tol=0.01)
+                        else "mismatch"
+                    )
     return result
 
 
@@ -199,25 +260,26 @@ def normalize_columns(
     renamed = {}
     used = set()
     for column in result.columns:
-        base = snake_case(column)
+        base = str(column) if str(column).startswith("_") else snake_case(column)
         candidate, suffix = base, 2
         while candidate in used:
             candidate, suffix = f"{base}_{suffix}", suffix + 1
         used.add(candidate)
         renamed[column] = candidate
     result.rename(columns=renamed, inplace=True)
+    threshold = _parse_threshold()
     for column in list(result.columns):
         if column.startswith("_") or column == "is_total":
             continue
         values = result[column]
         name = vn_norm(column)
-        money_named = any(token in name for token in ("tien", "gia", "doanh thu", "thanh tien", "amount", "no", "thu"))
-        parsed = values.map(parse_money) if money_named else values.head(100).map(parse_money)
-        if money_named or parsed.notna().mean() >= 0.6:
-            if len(parsed) != len(values):
-                parsed = values.map(parse_money)
+        money_named = any(token in name for token in ("tien", "gia", "doanh thu", "thanh tien", "amount", "no", "thu", "price", "cost", "total"))
+        parsed = values.map(parse_money)
+        if money_named and parse_ratio(values, parse_money) >= threshold:
             result[f"{column}_goc"] = values
             result[column] = parsed
+        elif _looks_like_entity(column, values):
+            result[f"{column}_norm"] = values.map(vn_norm)
         if any(token in name for token in ("ngay", "date", "time", "thoi gian")):
             format_label, order = infer_date_format(values)
             samples = [str(value) for value in values.dropna().head(5).tolist()]
@@ -266,6 +328,9 @@ def normalize_columns(
             if dates.notna().any():
                 result[f"{column}_raw"] = values
                 result["ngay"] = dates
+        elif not money_named and parse_ratio(values, parse_plain_number) >= threshold:
+            result[f"{column}_goc"] = values
+            result[column] = values.map(lambda value: parse_plain_number(str(value)) if pd.notna(value) else None)
     return result
 
 
