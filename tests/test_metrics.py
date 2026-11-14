@@ -75,6 +75,16 @@ class MetricTests(unittest.TestCase):
         }))
         self.assertEqual(config, {"ok": False, "reason": "unmapped_status:1"})
 
+    def test_inference_abstains_on_negative_quantity_or_revenue(self):
+        for column, values in (("so_luong", [-1]), ("amount", [-10])):
+            config = infer_metric_config(_connect_duckdb({
+                "orders": pd.DataFrame({
+                    "ma_don": ["A"], "ngay": ["2025-01-01"],
+                    "status": ["Xong"], column: values,
+                })
+            }))
+            self.assertEqual(config, {"ok": False, "reason": "negative_values"})
+
     def test_context_passes_selected_table_profile(self):
         context = type("Context", (), {
             "con": object(),

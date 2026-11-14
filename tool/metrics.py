@@ -164,6 +164,16 @@ def infer_metric_config(conn: Any, profile: Any = None) -> dict[str, Any]:
             column for column, dtype, *_ in description
             if any(token in str(dtype).upper() for token in ("INT", "DECIMAL", "DOUBLE", "FLOAT", "REAL", "NUMERIC"))
         }
+        quantity_columns = [
+            column for column in numeric
+            if any(hint in column.casefold() for hint in ("so_luong", "sl", "qty", "quantity"))
+        ]
+        for column in quantity_columns:
+            if conn.execute(
+                f"SELECT 1 FROM {_q(selected)} "
+                f"WHERE {_q(column)} < 0 LIMIT 1"
+            ).fetchone():
+                return {"ok": False, "reason": "negative_values"}
         line_money, invoice_money = _money_columns(names, numeric)
         revenue = next((column for column in line_money if roles.get(column, {}).get("role") == "line_amount"), None)
         revenue = revenue or (line_money[0] if line_money else None)
@@ -221,6 +231,11 @@ def infer_metric_config(conn: Any, profile: Any = None) -> dict[str, Any]:
                 revenue_reason = "invoice total, MAX per order after repeated-value validation"
         if not revenue:
             return {"ok": False, "reason": "no reliable line-level revenue column"}
+        if conn.execute(
+            f"SELECT 1 FROM {_q(selected)} "
+            f"WHERE {_q(revenue)} < 0 LIMIT 1"
+        ).fetchone():
+            return {"ok": False, "reason": "negative_values"}
         status_column = _find_status_column(conn, selected, names)
         if status_column is None:
             return {"ok": False, "reason": "no status column"}

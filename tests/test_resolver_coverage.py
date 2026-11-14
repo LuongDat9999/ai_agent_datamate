@@ -90,6 +90,18 @@ class ResolverCoverageTests(unittest.TestCase):
         self.assertIsNone(candidate)
         self.assertEqual(reason, "compare_not_percent")
 
+    def test_compare_candidate_declares_percent(self):
+        candidate, reason = _resolver_candidate(
+            _Context(), CFG, "period_compare",
+            "doanh thu thay đổi bao nhiêu % so với kỳ trước",
+            {
+                "target": {"start": "2025-03-01", "end": "2025-03-31"},
+                "compare": {"start": "2025-02-01", "end": "2025-02-28"},
+            }, set(),
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(candidate.declared_type, "percent")
+
     def test_invoice_total_revenue_is_rejected(self):
         config = {**CFG, "revenue_basis": "invoice_total"}
         candidate, reason = _resolver_candidate(
@@ -106,6 +118,7 @@ class ResolverCoverageTests(unittest.TestCase):
         )
         self.assertIsNone(reason)
         self.assertEqual(candidate.rows, [[42]])
+        self.assertEqual(candidate.declared_type, "number")
 
     def test_gap_inside_range_abstains(self):
         candidate, reason = _resolver_candidate(

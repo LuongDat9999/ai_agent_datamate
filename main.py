@@ -318,6 +318,9 @@ def _resolver_candidate(
             raw="resolver",
             type_source="resolver",
             inferred_type=answer_type,
+            declared_type=(
+                "percent" if archetype in {"period_compare", "cancel_rate"} else "number"
+            ),
         )
         return candidate, None
     except Exception as error:

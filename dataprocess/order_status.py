@@ -12,19 +12,19 @@ import pandas as pd
 from .cleaner import vn_norm
 
 STATUS_VALUES = {
-    "huy": frozenset({"huy", "da huy", "huy don", "cancel", "cancelled"}),
+    "huy": frozenset({"huy", "da huy", "huy don", "cancel", "cancelled", "huy bo", "huy don hang", "khong giao duoc", }),
     "tra_hang": frozenset({
         "tra hang", "doi tra", "tra lai", "hoan tra", "hoan hang", "hoan tien",
-        "da tra", "return", "returned",
+        "da tra", "return", "returned","tra hang hoan tien", "tra hang hoan lai", "tra hang hoan hang", "tra hang hoan tra", "hang tra lai", "tra hang hoan tien", "tra hang hoan lai", "tra hang hoan hang", "tra hang hoan tra", "hang tra lai","hang tra ve"
     }),
-    "dang_giao": frozenset({"dang giao", "cho giao", "dang van chuyen", "shipping"}),
-    "hoan_thanh": frozenset({"xong", "hoan thanh", "completed", "done"}),
+    "dang_giao": frozenset({"dang giao", "cho giao", "dang van chuyen", "shipping", "dang giao hang", "dang van chuyen hang", "dang van chuyen don hang", "dang giao don hang", "cho giao hang", "cho giao don hang", "dang gui", "dang xu ly"}),
+    "hoan_thanh": frozenset({"xong", "ok", "hoan thanh", "completed", "done", "da lay", "da hoan thanh", "thanh cong"}),
 }
 _LOGGER = logging.getLogger(__name__)
 _STATUS_PHRASES = {
-    "tra_hang": ("hoan hang", "hoan tra", "tra hang", "doi tra", "hoan tien", "tra lai", "da tra", "returned", "return"),
-    "hoan_thanh": ("da hoan thanh", "hoan thanh", "completed", "done", "xong"),
-    "dang_giao": ("dang van chuyen", "dang giao", "cho giao", "shipping"),
+    "tra_hang": ("hoan hang", "hoan tra", "tra hang", "doi tra", "hoan tien", "tra lai", "da tra", "hang tra ve", "returned", "return"),
+    "hoan_thanh": ("da hoan thanh", "hoan thanh", "completed", "done", "xong", "thanh cong", "ok", "da lay"),
+    "dang_giao": ("dang van chuyen", "dang giao", "cho giao", "shipping", "dang gui", "dang xu ly"),
     "huy": ("da huy", "huy don", "cancelled", "cancel", "huy"),
 }
 _ORDERED_STATUS_PHRASES = tuple(

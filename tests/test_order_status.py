@@ -48,6 +48,19 @@ class OrderStatusTest(unittest.TestCase):
         _, standardized = standardize_statuses({"orders": pd.DataFrame({"status": ["Đổi trả"]})})
         self.assertEqual(standardized["orders"]["trang_thai_chuan"].tolist(), ["tra_hang"])
 
+    def test_requested_status_phrases_are_classified(self):
+        _, standardized = standardize_statuses({"orders": pd.DataFrame({
+            "status": [
+                "Thành công", "OK", "Đã lấy", "Đã hoàn thành",
+                "Đang gửi", "Đang xử lý", "Hàng trả về",
+            ]
+        })})
+        self.assertEqual(
+            standardized["orders"]["trang_thai_chuan"].tolist(),
+            ["hoan_thanh", "hoan_thanh", "hoan_thanh", "hoan_thanh",
+             "dang_giao", "dang_giao", "tra_hang"],
+        )
+
     def test_table_without_status_does_not_create_views(self):
         tables = {"orders": pd.DataFrame({"amount": [1, 2], "name": ["a", "b"]})}
         detected, standardized = standardize_statuses(tables)
